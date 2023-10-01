@@ -805,7 +805,7 @@ class SplitSolver():
     # Set integration domain to end specifically at choking
     xlims_unlimited = (0, 8000)
     if xlims_unlimited[1] < xlims[1]:
-      ... # log xlim modification
+      self.logger.warning(f"numerical xlim modified: the physical domain is longer than the choke-limited domain")
       xlims_unlimited = 2 * xlims[1]
 
     # Upwinded vector of dx, repeating first element
@@ -888,37 +888,9 @@ class SplitSolver():
     self.logger.debug(f"Timestep loop entered with with dt = {dt}.")
     self.logger.debug(f"Setup time was {perf_counter() - clock_prep}.")
 
-    # Unsteady solve
-    for i in range(Nt):
-      t = i * dt
-      self.t = t
-      clock_step = perf_counter()
-
-      if self._use_grid_RHS_advance:
-        raise NotImplementedError("Feature removed in full_solve_choked. See full_solve.")
-      else:
-        # Measure and log L2 norm of solution
-        q5_L2 = np.sqrt(scipy.integrate.trapz(q5*q5, x=x, axis=1))
-        self.logger.debug(f"q5 L2-norm:                    {q5_L2}")
-        # Compute exact advection of interpolated q5 solution
-        q5_advected = self.advect_step(
-          BC_unsteady, x, t, self.dt, q5_interp, q2_interp, u0)
-        self.q5_advected = q5_advected
-        q5[:] = q5_advected
-        # Measure and log L2 norm of solution
-        q5_L2 = np.sqrt(scipy.integrate.trapz(q5*q5, x=x, axis=1))
-        self.logger.debug(f"q5 L2-norm advected:           {q5_L2}")
-        # Update source by analytic substep reaction
-        q5_reacted = self.react_step(x, t, self.dt, q5, self.q2)
-        self.q5_reacted = q5_reacted
-        q5[:] = q5_reacted
-        # Measure and log L2 norm of solution
-        q5_L2 = np.sqrt(scipy.integrate.trapz(q5*q5, x=x, axis=1))
-        self.logger.debug(f"q5 L2-norm advected + reacted: {q5_L2}")
-        
-      # Clipping mass fractions for undersaturated magma due to splitting error
-      # of advection and source
-      clip_eps = 1e-5
+    def clip_q5(solver:object, q5, q2, clip_eps=1e-5):
+      ''' Clip mass fractions for undersaturated magma due to splitting error
+      of advection and source. Attaches debug state to arg:solver '''
       # Check for dastardly unphysicalness
       msgs = ""
       if np.any(q5[1,...] > 1 + clip_eps) or np.any(q5[1,...] < 0 - clip_eps):
@@ -930,128 +902,146 @@ class SplitSolver():
       if np.any(q5[4,...] > 1 + clip_eps) or np.any(q5[4,...] < 0 - clip_eps):
         msgs += "yF exceeds physical range; "
       if len(msgs) > 0:
-        self._dump_q5 = q5.copy()
-        self._dump_p = q2[0,...]
-        self._dump_u = q2[1,...]
+        solver._dump_q5 = q5.copy()
+        solver._dump_p = q2[0,...]
+        solver._dump_u = q2[1,...]
         raise ValueError(msgs)
-
       q5_clipped = np.clip(q5[1:5,...], 0, 1)
-      self.logger.debug(f"Clip stage: is q5 == np.clip: {np.all(q5[1:5,...] == q5_clipped)}")
+      solver.logger.debug(f"Clip stage: is q5 == np.clip: {np.all(q5[1:5,...] == q5_clipped)}")
       # Clip to [0,1]
       q5[1:5,...] = q5_clipped
 
-      # Construct monotonic interpolants for indep system
-      q5_interp_raw = scipy.interpolate.PchipInterpolator(x,
-                                        q5,
-                                        extrapolate=True,
-                                        axis=1)      
-      def q5_interp(xq):
-        ''' Vectorized returns '''
-        return np.where(xq <= x.max(),
-                        q5_interp_raw(xq),
-                        q5[:,-1:])
-      def q5_interp_scalar(xq):
-        ''' Scalar returns'''
-        return np.where(xq <= x.max(),
-                        q5_interp_raw(xq),
-                        q5[:,-1])
-      self.q5_interp = q5_interp
-
-      if self._use_reverse_IVP:
-        raise NotImplementedError("Reverse IVP not verified (still needs shooting for top pressure)")
-        # Solve time-independent in reverse
-        yWv_vent = q5_interp_scalar(xlims[-1])[1,:]
-        # yWv_vent = split_solver._soln_steady.y[3,-1]
-        rho_vent = split_solver.rho_p(yWv_vent, p_vent)
-        _, ptilde_vent = split_solver.p_ptilde(rho_vent, yWv_vent)
-        c_vent = np.sqrt(split_solver.isothermal_sound_speed_squared(
-                          yWv_vent, p_vent, ptilde_vent))
-        # Compute velocity for Mach at 1 - M_eps
-        M_eps = 1e-4
-        u_vent = float((1.0 - M_eps) * c_vent)
-
-        soln = scipy.integrate.solve_ivp(
-          lambda x, q_scaled: split_solver.time_indep_RHS(
-            x, q_scaled * scales, r_interpolants, is_debug_mode=False) / scales,
-          xlims[::-1],
-          np.array([p_vent, u_vent]) / scales,
-          method=method,
-          dense_output=True,
-          max_step=max_step,
-          rtol=1e-4,
-          # atol=1e-8,
-          )
-      else:
-        # Solve time-independent system with shooting method
-        def solve_time_indep_ivp_L(u0_iterate):
-          ''' Full steady state problem, returning soln bunch and conduit length'''
-          soln, scales = self.solve_time_indep_system(
-            q5_interp_scalar,
-            p0=p0,
-            u0=u0_iterate,
-            xlims=xlims_unlimited,
-            method=ivp_method,
-            max_step=ivp_max_step)
-          return soln, soln.t.max()
-        
-        # self.logger.debug(f"Trying iterative time-independent solver with u0 = {float(self.u0)}")
-        # Try iterative solver using last u0 and rtol set to the ODE solver's tol
-        # u0_solved, self.fsolve_info, ier, mesg
-        # sol = scipy.optimize.root_scalar(
-        #   lambda u0: solve_time_indep_ivp_L(u0)[1] - xlims[-1],
-        #   x0=float(self.u0), xtol=1e-3, method="secant",
-        #   # full_output=True)
-        # )
-        # u0_solved = sol.root
-
-        self.logger.debug(f"Skipping iterative time-independent solver.")
-        sol = lambda: ()
-        sol.converged = False
-        sol.flag = None
-
-
-        if not sol.converged:
-          self.logger.warning(f"Iterative time-independent solver failed with u0 = {float(u0_solved)}")
-          self.logger.debug(f"Iterative solver flag: {sol.flag}")
-          bracket_L = (solve_time_indep_ivp_L(0.1)[1],
-                       solve_time_indep_ivp_L(5.500)[1])
-          self.logger.debug(f"Bracketing L values for 0.1, 5.5: {bracket_L}")
-          
-          # Shooting method for matching conduit length 
-          try:
-            u0_solved, self._brentq_results_time_indep = scipy.optimize.brentq(
-              lambda u0: solve_time_indep_ivp_L(u0)[1] - xlims[-1],
-              0.1, 5.5, full_output=True)
-          except ValueError as e:
-            raise ValueError(f"Input pressure {p0} may be insufficient to "
-                             +f"produce choked flow. Implement BVP using top/bottom pressure?"
-                             +f"Check also extrapolation of q5 in q2 solve.") from e
-          self.logger.debug(f"Bracketing time-independent solver (brentq) finished with u0 = {float(u0_solved)}")
-        else:
-          self.logger.debug(f"Iterative time-independent solver success with u0 = {float(u0_solved)}")
-          
-        # Solve system using solved u0
-        soln, scales = self.solve_time_indep_system(q5_interp_scalar, p0=p0,
-                                            u0=u0_solved,
-                                            xlims=xlims_unlimited,
-                                            method=ivp_method,
-                                            max_step=ivp_max_step)
-        # Cache u0 for next iteration
-        self.u0 = u0_solved
-
+    def get_q2_interp(solver, q5_interp_scalar, p0, xlims_unlimited, ivp_method,
+                      ivp_max_step) -> callable:
+      ''' Compute and return q2 interp. arg:solver is for storing debug state only. '''
+      # Solve time-independent system with shooting method
+      def solve_time_indep_ivp_L(u0_iterate):
+        ''' Full steady state problem, returning soln bunch and conduit length.
+        Solution is only correct when `scales` is applied.'''
+        soln, scales = solver.solve_time_indep_system(
+          q5_interp_scalar,
+          p0=p0,
+          u0=u0_iterate,
+          xlims=xlims_unlimited,
+          method=ivp_method,
+          max_step=ivp_max_step)
+        return soln, soln.t.max() 
+             
+      bracket_L = (solve_time_indep_ivp_L(0.1)[1],
+                    solve_time_indep_ivp_L(5.500)[1])
+      solver.logger.debug(f"Bracketing L values for 0.1, 5.5: {bracket_L}")        
+      # Shooting method for matching conduit length 
+      try:
+        u0_solved, solver._brentq_results_time_indep = scipy.optimize.brentq(
+          lambda u0: solve_time_indep_ivp_L(u0)[1] - xlims[-1],
+          0.1, 5.5, full_output=True)
+      except ValueError as e:
+        raise ValueError(f"Input pressure {p0} may be insufficient to "
+                          +f"produce choked flow. Implement BVP using top/bottom pressure?"
+                          +f"Check also extrapolation of q5 in q2 solve.") from e
+      solver.logger.debug(f"Bracketing time-independent solver (brentq) finished with u0 = {float(u0_solved)}")
+      # Solve system using solved u0
+      soln, scales = solver.solve_time_indep_system(q5_interp_scalar, p0=p0,
+                                          u0=u0_solved,
+                                          xlims=xlims_unlimited,
+                                          method=ivp_method,
+                                          max_step=ivp_max_step)
+      # Cache u0 for next iteration
+      solver.u0 = u0_solved
       # Shift solution so that choked flow is exactly at conduit_length
       #   This strategy extrapolates on the bottom instead of the top
-      q2_interp = lambda x: np.einsum("i..., i -> i...",
-                                      soln.sol(x + (soln.t.max() - xlims[-1])),
-                                      scales)
-      # TODO: prevent undefined behaviour when called with a scalar
-      # q2_interp = lambda x: np.where(x <= soln.t.max(),
-      #                                soln.sol(x),
-      #                                soln.y[:,-1:]) * scales[:,np.newaxis]
+      return lambda x: np.einsum("i..., i -> i...",
+                                 soln.sol(x + (soln.t.max() - xlims[-1])),
+                                 scales)
+
+    # Unsteady solve
+    for i in range(Nt):
+      t = i * dt
+      self.t = t
+      clock_step = perf_counter()
+
+      # Measure and log L2 norm of solution
+      q5_L2 = np.sqrt(scipy.integrate.trapz(q5*q5, x=x, axis=1))
+      self.logger.debug(f"q5 L2-norm:                    {q5_L2}")
+
+      # Update source by analytic substep reaction (1/2)
+      q5[:] = self.react_step(x, t, 0.5 * self.dt, q5, self.q2)
+      # Measure and log L2 norm of solution
+      q5_L2 = np.sqrt(scipy.integrate.trapz(q5*q5, x=x, axis=1))
+      self.logger.debug(f"q5 L2-norm reacted      dt1/2: {q5_L2}")
+      # Clip mass fractions
+      clip_q5(self, q5, q2, clip_eps=1e-5)
+
+      # Construct monotonic q5 interpolant
+      q5_interp_raw = scipy.interpolate.PchipInterpolator(x, q5,
+        extrapolate=True, axis=1)      
+      # TODO: prevent undefined behaviour when called with a scalar, merge following two funcs
+      def q5_interp(xq):
+        ''' Vectorized returns '''
+        return np.where(xq <= x.max(), q5_interp_raw(xq), q5[:,-1:])
+      def q5_interp_scalar(xq):
+        ''' Scalar returns'''
+        return np.where(xq <= x.max(), q5_interp_raw(xq), q5[:,-1])
+      self.q5_interp = q5_interp
+
+      # q2 solve and obtain interpolator
+      q2_interp = get_q2_interp(self, q5_interp_scalar, p0, xlims_unlimited,
+                                ivp_method, ivp_max_step)
       self.q2_interp = q2_interp
       # Grid restriction for unsteady solver
-      #   with extrapolation guard: applying restriction to locations above
-      #   isothermal choking returns last value instead
+      self.q2 = q2_interp(x)
+
+      # Compute exact advection of interpolated q5 solution
+      q5[:] = self.advect_step(
+        BC_unsteady, x, t, self.dt, q5_interp, q2_interp, u0)
+      # Measure and log L2 norm of solution
+      q5_L2 = np.sqrt(scipy.integrate.trapz(q5*q5, x=x, axis=1))
+      self.logger.debug(f"q5 L2-norm advected:           {q5_L2}")
+
+      # Construct monotonic interpolants for indep system
+      q5_interp_raw = scipy.interpolate.PchipInterpolator(x, q5,
+        extrapolate=True, axis=1)      
+      # TODO: prevent undefined behaviour when called with a scalar, merge following two funcs
+      def q5_interp(xq):
+        ''' Vectorized returns '''
+        return np.where(xq <= x.max(), q5_interp_raw(xq), q5[:,-1:])
+      def q5_interp_scalar(xq):
+        ''' Scalar returns'''
+        return np.where(xq <= x.max(), q5_interp_raw(xq), q5[:,-1])
+      self.q5_interp = q5_interp
+
+      # q2 solve and obtain interpolator
+      q2_interp = get_q2_interp(self, q5_interp_scalar, p0, xlims_unlimited,
+                                ivp_method, ivp_max_step)
+      self.q2_interp = q2_interp
+      # Grid restriction for unsteady solver
+      self.q2 = q2_interp(x)
+
+      # Update source by analytic substep reaction (2/2)
+      q5[:] = self.react_step(x, t, 0.5 * self.dt, q5, self.q2)
+      # Measure and log L2 norm of solution
+      q5_L2 = np.sqrt(scipy.integrate.trapz(q5*q5, x=x, axis=1))
+      self.logger.debug(f"q5 L2-norm reacted      dt2/2: {q5_L2}")
+      # Clip mass fractions
+      clip_q5(self, q5, q2, clip_eps=1e-5)
+
+      # Construct monotonic interpolants for indep system
+      q5_interp_raw = scipy.interpolate.PchipInterpolator(x, q5,
+        extrapolate=True, axis=1)      
+      # TODO: prevent undefined behaviour when called with a scalar, merge following two funcs
+      def q5_interp(xq):
+        ''' Vectorized returns '''
+        return np.where(xq <= x.max(), q5_interp_raw(xq), q5[:,-1:])
+      def q5_interp_scalar(xq):
+        ''' Scalar returns'''
+        return np.where(xq <= x.max(), q5_interp_raw(xq), q5[:,-1])
+      self.q5_interp = q5_interp
+
+      # q2 solve and obtain interpolator
+      q2_interp = get_q2_interp(self, q5_interp_scalar, p0, xlims_unlimited,
+                                ivp_method, ivp_max_step)
+      self.q2_interp = q2_interp
+      # Grid restriction for unsteady solver
       self.q2 = q2_interp(x)
 
       # Save outputs
@@ -1153,7 +1143,7 @@ if __name__ == "__main__":
   q2, q5 = split_solver.full_solve_choked((0,2100), Nx=1001, p0=80e6, u0=0.7, yWt0=0.025,
                   yC0=0.4, yF0=0.0, CFL=100)
   print(f"Final t: {split_solver.t} s")
-  np.save("out_q2_new2", split_solver.out_q2)
-  np.save("out_q5_new2", split_solver.out_q5)
-  np.save("out_t_new2", split_solver.out_t)
-  np.save("out_x_new2", split_solver.x)
+  np.save("out_q2_strang_1", split_solver.out_q2)
+  np.save("out_q5_strang_1", split_solver.out_q5)
+  np.save("out_t_strang_1", split_solver.out_t)
+  np.save("out_x_strang_1", split_solver.x)
