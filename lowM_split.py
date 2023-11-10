@@ -4,6 +4,7 @@ import numpy as np
 import scipy.integrate
 import scipy.interpolate
 import scipy.sparse
+import scipy.special
 from time import perf_counter
 
 class SplitSolver():
@@ -76,7 +77,7 @@ class SplitSolver():
   def isothermal_mach_squared(self, u, yWv, p, ptilde):
     return u * u / self.isothermal_sound_speed_squared(yWv, p, ptilde)
   
-  def isothermal_mach_squared_simple(self, u, yWv, p):
+  def isothermal_mach_simple(self, u, yWv, p):
     rho = self.rho_p(yWv, p)
     _, ptilde = self.p_ptilde(rho, yWv)
     return u / np.sqrt(self.isothermal_sound_speed_squared(yWv, p, ptilde))
@@ -166,13 +167,16 @@ class SplitSolver():
       * _ddp_group
     return _num / ((2*p - ptilde) * (2*p - ptilde))
   
-  def RHS_jac(self, p, u, yWv, yWt, yC, yF):
+  def RHS_jac(self, p, u, yWv, yWt, yC, yF, also_return_RHS=False):
     ''' Analytic Jacobian of RHS as Ainv@f, w.r.t state vector [p, u]. Only
     for tau_d, tau_f > 0.
     This function proceeds by computing:
       1. (Ainv)_ij @ (d_k f_j)
     and then
-      2. (d_k (Ainv)_ij) @ f_j. '''
+      2. (d_k (Ainv)_ij) @ f_j.
+
+    If also_return_RHS==True, returns (jac, f)
+    '''
 
     ''' Compute simple dependents '''
     rho = self.rho_p(yWv, p)
@@ -197,7 +201,7 @@ class SplitSolver():
     f = np.stack([
       _dp_dyw * (yWt - yWdHat - yWv) / self.tau_d,
       -F_fric/rho - 9.8,
-    ], axis=1)
+    ], axis=-1)
     
     ''' Compute Ainv times jacobian of f (without inverse mass matrix) '''
     Juu = -8.0 * mu / rho / (self.conduit_radius * self.conduit_radius) \
@@ -220,7 +224,7 @@ class SplitSolver():
     _h1 = ddp_dpdYWv * (yWt - yWdHat - yWv) / self.tau_d
     _h2 = -_dp_dyw / self.tau_d * (self.solubility_k
           * self.solubility_n * p_like**(self.solubility_n - 1) * yL)
-    _h2 = np.where(yWt >= self.solubility_k * p ** self.solubility_n * yL,
+    _h2 = np.where(yWt >= self.solubility_k * p_like ** self.solubility_n * yL,
                    _h2, 0.0)
     Jpp = _h1 + _h2
     # Assemble jacobian of f
@@ -244,16 +248,20 @@ class SplitSolver():
     _dAdp_Ainvf = np.stack([
       _dAdp_01 * _Ainvf[...,1],
       _dAdp_10 * _Ainvf[...,0],
-    ], axis=1)
+    ], axis=-1)
     # rank3-rank1 part: dAinv @ f
     # _prod31 = np.stack([
     #   -np.einsum("ij..., ...j -> ...i", Ainv, _dAdp_Ainvf),
     #   -np.einsum("ij..., ...j -> ...i", Ainv, _Ainvf),
     # ], axis=2)
     # Factorized version: stack partial results without left-factor Ainv
-    _factoredprod31 = np.stack([-_dAdp_Ainvf, -_Ainvf,], axis=2)
+    _factoredprod31 = np.stack([-_dAdp_Ainvf, -_Ainvf,], axis=-1)
 
-    return np.einsum("ij..., ...jk -> ...ik", Ainv, _fjac + _factoredprod31)
+    jac = np.einsum("ij..., ...jk -> ...ik", Ainv, _fjac + _factoredprod31)
+    if also_return_RHS:
+      return jac, _Ainvf
+    else:
+      return jac
     # Unfactorized version would do:
     # return _prod22 + _prod31
   
@@ -646,9 +654,487 @@ class SplitSolver():
             events=[event_isothermal_choked,])
     return soln_steady
 
-  def time_indep_RHS(self, x, q2:np.array, r_interpolants:callable,
-                     is_debug_mode=False):
+  def time_indep_RHS(self, x, q2:np.array, r_interpolants,
+                     is_debug_mode=False, use_integrated_friction=True,
+                     is_r_pre_eval=False):
     ''' RHS for time-independent portion of the system.
+    Inputs:
+      x -- independent coordinate
+      q2 -- state vector of size 2 (p, u)
+      r_interpolants -- interpolation for slow-time-dependent variables
+          if r_pre_eval==False, r_interpolants is callable
+          else, r_interpolants are np.array
+      is_debug_mode (optional) -- flag for returning debug quantities
+      use_integrated_friction (optional) -- use built-in friction model (faster)
+    '''    
+    # Interpolate solution for time-dependent quantities
+    if is_r_pre_eval:
+      r = r_interpolants
+    else:
+      r = r_interpolants(x)
+    if len(r.shape) > 1:
+      # Shape check
+      raise ValueError("Data has more than 1 axis. This function is only for scalar inputs.")
+    # Unpack quantities
+    p         = q2[0]
+    u         = q2[1]
+    yWv       = r[1]
+    yWt       = r[2]
+    yC        = r[3]
+    yF        = r[4]
+    # Extract spatial derivative of rho prime
+    # dyw_dt        = dyw_dt_interpolant(t)
+    '''Compute aliases'''
+    yM = 1.0 - yWv
+    yWd = yWt - yWv
+    yL = (yM - (yC + yWd))
+
+    '''Compute EOS quantities'''
+    v = yWv * self.vWv_p(p) + yM * self.vM_p(p)
+    rho = 1.0 / v
+    _, ptilde = self.p_ptilde(rho, yWv)
+    # Compute mixture isothermal sound speed, squared
+    cT2 = self.isothermal_sound_speed_squared(yWv, p, ptilde)
+    # Compute partial of pressure w.r.t. water mass fraction (const rho, T)
+    dp_dyw = self.dp_dyw(rho, p, ptilde)
+
+    # Compute solubility based on pure silicate melt mass fraction
+    p_like = max(p, 0)
+
+    if self.solubility_n == 0.5:
+      yHat = min(max(self.solubility_k * np.sqrt(p_like) * yL, 0), yWt)
+    else:
+      yHat = np.clip(self.solubility_k * p_like ** self.solubility_n * yL, 0, yWt)
+  
+    # Compute sources
+    source_yWv = (yWd - yHat) / (self.tau_d)
+
+    # Compute momentum load
+    if use_integrated_friction:
+      # Calculate pure melt viscosity (Hess & Dingwell 1996)
+      mfWd = yWd / yL # mass concentration of dissolved water: note model is
+      # maximized for a small number, diverging at 0
+      mfWd = max(mfWd, 1e-8)
+      log_mfWd = np.log(mfWd*100)
+      log10_vis = -3.545 + 0.833 * log_mfWd
+      log10_vis += (9601 - 2368 * log_mfWd) / (self.T0 - 195.7 - 32.25 * log_mfWd)
+      # Melt viscosity with overflow protection
+      meltVisc = 10**min(log10_vis, 300)
+      # Calculate relative viscosity due to crystals (Costa 2005).
+      alpha = 0.999916
+      phi_cr = 0.673
+      gamma = 3.98937
+      delta = 16.9386
+      B = 2.5
+      # Compute volume fraction of crystal at equal phasic densities
+      # Using crystal volume per (melt + crystal + dissolved water) volume
+      phi_ratio = max((yC / yM) / phi_cr, 0.0)
+      erf_term = scipy.special.erf(
+        np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
+      crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
+      mu = meltVisc * crysVisc
+    else:
+      mu = self.F_fric_viscosity_model(self.T0, yWv, yF, yWt=yWt, yC=yC)
+    
+    frag_factor = min(max(1.0 - yF/yM, 0.0), 1.0)
+    F_fric = 8.0 * mu / (self.conduit_radius * self.conduit_radius) * u \
+      * frag_factor
+    source_momentum = (-rho * 9.8 - F_fric) / rho
+
+    # Debug output
+    if not is_debug_mode:
+      # Compute explicitly inverted LHS matrix
+      _det = u*u - cT2
+      b0 = dp_dyw * source_yWv
+      b1 = source_momentum
+      return np.array([(u * b0 + -rho * cT2 * b1) / _det,
+                      (-v * b0 + u * b1) / _det
+                      ])
+    
+    #   for state vector [rho_bar, u]
+    Ainv = np.array([[u, -rho*cT2], [-v, u]]) / (u*u - cT2)
+    # Compute RHS vector
+    b = np.stack([dp_dyw * source_yWv,
+                  + source_momentum,
+                  ], axis=0)
+    return Ainv, b, Ainv @ b
+  
+  def time_indep_RHS(self, x, q2:np.array, r_interpolants,
+                     is_debug_mode=False, use_integrated_friction=True,
+                     is_r_pre_eval=False):
+    ''' RHS for time-independent portion of the system.
+    Inputs:
+      x -- independent coordinate
+      q2 -- state vector of size 2 (p, u)
+      r_interpolants -- interpolation for slow-time-dependent variables
+          if r_pre_eval==False, r_interpolants is callable
+          else, r_interpolants are np.array
+      is_debug_mode (optional) -- flag for returning debug quantities
+      use_integrated_friction (optional) -- use built-in friction model (faster)
+    '''    
+    # Interpolate solution for time-dependent quantities
+    if is_r_pre_eval:
+      r = r_interpolants
+    else:
+      r = r_interpolants(x)
+    if len(r.shape) > 1:
+      # Shape check
+      raise ValueError("Data has more than 1 axis. This function is only for scalar inputs.")
+    # Unpack quantities
+    p         = q2[0]
+    u         = q2[1]
+    yWv       = r[1]
+    yWt       = r[2]
+    yC        = r[3]
+    yF        = r[4]
+    # Extract spatial derivative of rho prime
+    # dyw_dt        = dyw_dt_interpolant(t)
+    '''Compute aliases'''
+    yM = 1.0 - yWv
+    yWd = yWt - yWv
+    yL = (yM - (yC + yWd))
+
+    '''Compute EOS quantities'''
+    v = yWv * self.vWv_p(p) + yM * self.vM_p(p)
+    rho = 1.0 / v
+    _, ptilde = self.p_ptilde(rho, yWv)
+    # Compute mixture isothermal sound speed, squared
+    cT2 = self.isothermal_sound_speed_squared(yWv, p, ptilde)
+    # Compute partial of pressure w.r.t. water mass fraction (const rho, T)
+    dp_dyw = self.dp_dyw(rho, p, ptilde)
+
+    # Compute solubility based on pure silicate melt mass fraction
+    p_like = max(p, 0)
+
+    if self.solubility_n == 0.5:
+      yHat = min(max(self.solubility_k * np.sqrt(p_like) * yL, 0), yWt)
+    else:
+      yHat = np.clip(self.solubility_k * p_like ** self.solubility_n * yL, 0, yWt)
+  
+    # Compute sources
+    source_yWv = (yWd - yHat) / (self.tau_d)
+
+    # Compute momentum load
+    if use_integrated_friction:
+      # Calculate pure melt viscosity (Hess & Dingwell 1996)
+      mfWd = yWd / yL # mass concentration of dissolved water: note model is
+      # maximized for a small number, diverging at 0
+      mfWd = max(mfWd, 1e-8)
+      log_mfWd = np.log(mfWd*100)
+      log10_vis = -3.545 + 0.833 * log_mfWd
+      log10_vis += (9601 - 2368 * log_mfWd) / (self.T0 - 195.7 - 32.25 * log_mfWd)
+      # Melt viscosity with overflow protection
+      meltVisc = 10**min(log10_vis, 300)
+      # Calculate relative viscosity due to crystals (Costa 2005).
+      alpha = 0.999916
+      phi_cr = 0.673
+      gamma = 3.98937
+      delta = 16.9386
+      B = 2.5
+      # Compute volume fraction of crystal at equal phasic densities
+      # Using crystal volume per (melt + crystal + dissolved water) volume
+      phi_ratio = max((yC / yM) / phi_cr, 0.0)
+      erf_term = scipy.special.erf(
+        np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
+      crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
+      mu = meltVisc * crysVisc
+    else:
+      mu = self.F_fric_viscosity_model(self.T0, yWv, yF, yWt=yWt, yC=yC)
+    
+    frag_factor = min(max(1.0 - yF/yM, 0.0), 1.0)
+    F_fric = 8.0 * mu / (self.conduit_radius * self.conduit_radius) * u \
+      * frag_factor
+    source_momentum = (-rho * 9.8 - F_fric) / rho
+
+    # Debug output
+    if not is_debug_mode:
+      # Compute explicitly inverted LHS matrix
+      _det = u*u - cT2
+      b0 = dp_dyw * source_yWv
+      b1 = source_momentum
+      return np.array([(u * b0 + -rho * cT2 * b1) / _det,
+                      (-v * b0 + u * b1) / _det
+                      ])
+    
+    #   for state vector [rho_bar, u]
+    Ainv = np.array([[u, -rho*cT2], [-v, u]]) / (u*u - cT2)
+    # Compute RHS vector
+    b = np.stack([dp_dyw * source_yWv,
+                  + source_momentum,
+                  ], axis=0)
+    return Ainv, b, Ainv @ b
+    
+  def _primal_RHS(self, x, q2:np.array, q5:np.array, ddx_q5:np.array,
+                 use_integrated_friction=True, _M2_as_u=True):
+    ''' Point evaluation of RHS for time-independent portion of the system,
+    as the (p, u) system. If _M2_as_u==False, uses (p,M2) system.
+    Vectorized for several q2 inputs (faster numerical Jacobian) but single
+    q5 input.
+    Inputs:
+      x -- independent coordinate
+      q2 -- state vector of size 2 (p, u)
+      r_interpolants -- interpolation for slow-time-dependent variables
+      is_debug_mode (optional) -- flag for returning debug quantities
+      use_integrated_friction (optional) -- use built-in friction model (faster)
+    '''
+
+    # Unpack quantities
+    p         = q2[0,:]
+    M2        = q2[1,:] # replaced with u if flagged TODO: clean up M2/u
+    yWv       = q5[1]
+    yWt       = q5[2]
+    yC        = q5[3]
+    yF        = q5[4]
+    # Extract spatial derivative of rho prime
+    # dyw_dt        = dyw_dt_interpolant(t)
+    '''Compute aliases'''
+    yM = 1.0 - yWv
+    yWd = yWt - yWv
+    yL = (yM - (yC + yWd))
+
+    '''Compute EOS quantities'''
+    v = yWv * self.vWv_p(p) + yM * self.vM_p(p)
+    rho = 1.0 / v
+    _, ptilde = self.p_ptilde(rho, yWv)
+    # Compute mixture isothermal sound speed, squared
+    cT2 = self.isothermal_sound_speed_squared(yWv, p, ptilde)
+    if _M2_as_u:
+      u = M2
+      M2 = u*u / cT2
+    else:
+      # Take positive velocity
+      u = np.sqrt(M2 * cT2)
+    # Compute partial of pressure w.r.t. water mass fraction (const rho, T)
+    dp_dyw = self.dp_dyw(rho, p, ptilde)
+    d2rho_dp2 = -self.ddp_cT2(yWv, yWt, yC, p) / (cT2*cT2)
+
+    # Compute solubility based on pure silicate melt mass fraction
+    p_like = np.maximum(p, 0)
+
+    if self.solubility_n == 0.5:
+      yHat = np.clip(self.solubility_k * np.sqrt(p_like) * yL, 0, yWt)
+    else:
+      yHat = np.clip(self.solubility_k * p_like ** self.solubility_n * yL, 0, yWt)
+  
+    # Compute sources
+    source_yWv = (yWd - yHat) / (self.tau_d)
+
+    # Compute momentum load
+    if use_integrated_friction:
+      # Calculate pure melt viscosity (Hess & Dingwell 1996)
+      mfWd = yWd / yL # mass concentration of dissolved water: note model is
+      # maximized for a small number, diverging at 0
+      mfWd = np.maximum(mfWd, 1e-8)
+      log_mfWd = np.log(mfWd*100)
+      log10_vis = -3.545 + 0.833 * log_mfWd
+      log10_vis += (9601 - 2368 * log_mfWd) / (self.T0 - 195.7 - 32.25 * log_mfWd)
+      # Melt viscosity with overflow protection
+      meltVisc = 10**np.minimum(log10_vis, 300)
+      # Calculate relative viscosity due to crystals (Costa 2005).
+      alpha = 0.999916
+      phi_cr = 0.673
+      gamma = 3.98937
+      delta = 16.9386
+      B = 2.5
+      # Compute volume fraction of crystal at equal phasic densities
+      # Using crystal volume per (melt + crystal + dissolved water) volume
+      phi_ratio = np.maximum((yC / yM) / phi_cr, 0.0)
+      erf_term = scipy.special.erf(
+        np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
+      crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
+      mu = meltVisc * crysVisc
+    else:
+      mu = self.F_fric_viscosity_model(self.T0, yWv, yF, yWt=yWt, yC=yC)
+    
+    frag_factor = np.clip(1.0 - yF/yM, 0.0, 1.0)
+    F_fric = 8.0 * mu / (self.conduit_radius * self.conduit_radius) * u \
+      * frag_factor
+    source_momentum = (-rho * 9.8 - F_fric) / rho
+
+    # Compute (p,u) RHS with explicitly inverted LHS matrix
+    _det = u*u - cT2
+    b0 = dp_dyw * source_yWv
+    b1 = source_momentum
+    # Implicit stack for vector inputs
+    g = np.array([(u * b0 + -rho * cT2 * b1) / _det,
+                  (-v * b0 + u * b1) / _det
+                 ])
+    
+    if _M2_as_u:
+      return g
+
+    # Lower triangular transformation (p, u) -> (p, M2)
+    # _B = np.array([[1, 0], [_B10, _B11]])
+    _B10 = u * u * d2rho_dp2
+    _B11 = 2 * M2 / u
+    # Independent variable chain rule term
+    _M2_plus = (self.isothermal_mach_simple(u, yWv + 0.5e-8, p) ** 2)
+    _M2_minus = (self.isothermal_mach_simple(u, yWv - 0.5e-8, p) ** 2)
+    _dM2_dyWv = (_M2_plus - _M2_minus ) / (1e-8)
+    _dyWv_dx = ddx_q5[1]
+    # Implicit stack for vector inputs
+    f = np.array([g[0], _B10 * g[0] + _B11 * g[1] + _dM2_dyWv * _dyWv_dx])
+    return f    
+
+  def primal_var_RHS(self, x:np.array, Q:np.array,
+                     q5_interp:callable,
+                     use_integrated_friction=True):
+    ''' Primal equation RHS and variational equation RHS.
+      Uses a finite difference estimation for jacobian of primal equation RHS.
+      Input:
+        x
+        Q: [q, asvector(dq/dp_inlet)]
+        q5_interp: vector interpolator for slow (quasi steady state) states '''
+
+    q5 = q5_interp(x)
+    # dq5_dx = q5_interp(x, nu=1)
+
+    # Extract data
+    q2 = Q[0:2]
+    Z = Q[2:4]
+
+    _use_num_diff = False
+    if _use_num_diff:
+      # Central difference Jacobian estimation parameters
+      e1 = np.array([1, 0])
+      h1 = 0.1 # Pressure epsilon
+      e2 = np.array([0, 1])
+      h2 = 1e-6 # M2 epsilon
+      # Distribute data for numerical Jacobian evaluation of primal RHS
+      # M2 uses positive finite difference
+      # IMPORTANT: make sure M_eps is large enough for this if using M2
+      q_vec =  np.stack([q2,
+                        q2 + 0.5 * h1 * e1,
+                        q2 - 0.5 * h1 * e1,
+                        q2 + 0.5 * h2 * e2,
+                        q2 + h2 * e2], axis=1)
+      # Compute primal RHS
+      f_vec = self._primal_RHS(x, q_vec, q5, None,
+                          use_integrated_friction=use_integrated_friction,
+                          _M2_as_u=True)
+      dfdp = (f_vec[:,1] - f_vec[:,2]) / h1
+      dfdu = (-3 * f_vec[:,0] + 4 * f_vec[:,3] - f_vec[:,4]) / h2
+      rhs = f_vec[:,0]
+    else:
+      _, yWv, yWt, yC, yF = q5
+      # Evaluate Jacobian of RHS and RHS
+      jac, rhs = self.RHS_jac(Q[0], Q[1],
+                                yWv, yWt, yC, yF,
+                                also_return_RHS=True)
+      # Extract partials from Jacobian (squeeze out axis 0)
+      dfdp = jac[0,:,0]
+      dfdu = jac[0,:,1]
+
+    # Evaluate matrix-vector product J*Z (aka J @ Z)
+    # J = np.array([dfdp, dfdM2]).T
+    JdotZ0 = dfdp[0] * Z[0] + dfdu[0] * Z[1]
+    JdotZ1 = dfdp[1] * Z[0] + dfdu[1] * Z[1]
+
+    # Evaluate RHS of primal and variational systems  
+    if len(Q) == 4:
+      # No estimation of d/dp_iterate of L1(p)
+      dQ = np.array([*rhs, JdotZ0, JdotZ1])
+    else:
+      dQ = np.array([*rhs, JdotZ0, JdotZ1, Z[0]])
+    return dQ
+
+  def newton_map_pout(self, p_inlet, p_outlet_iterate, xlim, q5_interp,
+                      ode_rtol=1e-6, M_eps=1e-2, use_integrated_friction=True):
+    ''' ODE solve wrapper for primal_var_RHS. '''
+
+    # Construct primal state
+    yWv_outlet = q5_interp(xlim[-1])[1]
+    rho_outlet = self.rho_p(yWv_outlet, p_outlet_iterate)
+    cT2_outlet = self.isothermal_sound_speed_squared(yWv_outlet, *self.p_ptilde(rho_outlet, yWv_outlet))
+    u_outlet = np.sqrt((1-M_eps) * (1-M_eps) * cT2_outlet)
+    # Assemble boundary condition of q2 at vent with column of identity and p-integral zero
+    # Q_pM2 = np.array([p_outlet_iterate, u_outlet, 1, 0, 0])
+    Q_pM2 = np.array([p_outlet_iterate, u_outlet, 1, 0])
+
+    # Flag for debugging by solving the IVP in the forward (upward) direction
+    _forward_ivp_debug = False
+    if _forward_ivp_debug:
+      soln = scipy.integrate.solve_ivp(
+        lambda x, Q: self.time_indep_RHS(x,
+            Q[:,np.newaxis] * np.array([1, 1])[:,np.newaxis],
+            q5_interp(x),
+            use_integrated_friction=True,
+           is_r_pre_eval=True).ravel(),
+        (xlim[0], 1000),
+        np.array([40e6, self.u0]),
+        # np.array([40e6, 0.0005578129172335377**2]),
+        method="BDF",
+        dense_output=True,
+        max_step=np.inf,
+        rtol=1e-7,
+        atol=1e-6,)
+      soln_orig = scipy.integrate.solve_ivp(
+        lambda x, Q: self.time_indep_RHS(x, Q, q5_interp,
+          use_integrated_friction=True).ravel(),
+        (xlim[0], 1000),
+        np.array([p_inlet, self.u0]),
+        method="BDF",
+        dense_output=True,
+        max_step=np.inf,
+        rtol=1e-7,
+        atol=1e-6,)
+      _q5 = np.array([q5_interp(_x) for _x in soln_orig.t]).T
+      _M2 = (self.isothermal_mach_simple(soln_orig.y[1,...],
+                                         _q5[1:2,...],
+                                         soln_orig.y[0,...]) ** 2).ravel()
+
+
+      soln_primal_var = scipy.integrate.solve_ivp(
+        lambda x, Q: self.primal_var_RHS(x, Q, q5_interp,
+          use_integrated_friction=use_integrated_friction),
+        (xlim[0], 1000),
+        np.array([40e6, 0.0005578129172335377**2, 1, 0]),
+        method="BDF",
+        dense_output=True,
+        max_step=np.inf,
+        rtol=ode_rtol,
+        atol=1e-4,)
+      _debug = "this is for breakpoint"
+
+    # Solve from M2 condition down to inlet
+    soln = scipy.integrate.solve_ivp(
+      lambda x, Q: self.primal_var_RHS(x, Q, q5_interp,
+        use_integrated_friction=use_integrated_friction),
+      (xlim[-1], xlim[0]),
+      Q_pM2,
+      method="RK45",
+      dense_output=True, # TODO: request only dense output for the last output
+      max_step=np.inf,
+      rtol=ode_rtol,
+      atol=1e-6,)
+    # Interpret solution at inlet
+    p_in_solved = soln.y[0,-1]
+    dpin_dpout = soln.y[2,-1]
+    duin_dpout = soln.y[3,-1] # Use for estimating u-sensitivity
+    if soln.y.shape[0] >= 5:
+      d_dpout_integralp = soln.y[4,-1]
+    else:
+      d_dpout_integralp = None
+    uin = soln.y[1, -1]
+
+    # Old stuff for (p, M2) system -- this needed chain rule into dyWv/dx
+    # M2in = soln.y[1,-1]
+    # _, yWv, yWt, yC, yF = q5_interp(xlim[0])
+    # rho = self.rho_p(yWv, p_in_solved)
+    # _, ptilde = self.p_ptilde(rho, yWv)
+    # cT2in = self.isothermal_sound_speed_squared(yWv, p_in_solved, ptilde)
+    # uin = np.sqrt(M2in * cT2in)
+    # Return new iterate, inlet velocity, slope
+    residual = (p_in_solved - p_inlet)
+    newton_step = - residual / dpin_dpout
+    # Estimate change in u_in after a Newton step (recall: want uin > 0)
+    uin_change_estimate = newton_step * duin_dpout
+    return p_outlet_iterate + newton_step, residual, uin, dpin_dpout, \
+      duin_dpout, uin_change_estimate, d_dpout_integralp, soln
+
+  def _time_indep_RHS_explicit(self, x, q2:np.array, r_interpolants:callable,
+                     is_debug_mode=False):
+    ''' Copy of RHS for time-independent portion of the system.
     Inputs:
       x -- independent coordinate
       q2 -- state vector of size 2 (p, u)
@@ -835,7 +1321,7 @@ class SplitSolver():
       method=method,
       dense_output=True,
       max_step=max_step,
-      rtol=1e-6,
+      rtol=1e-8,
       atol=1e-8,
       events=[event_isothermal_choked,])
     return soln, scales
@@ -1646,6 +2132,8 @@ class SplitSolver():
     # Replace density with pressure
     #   TODO: clean up by using pressure directly in steady state
     q2[0:1,...] = self.p_ptilde(q[0:1,...], q[3:4,...])[0]
+    # Cache pressure for reverse-IVP solve strategy
+    self.p_vent = q2[0,-1]
     # Add hooks for external access
     self.q2 = q2
     self.q5 = q5
@@ -1728,12 +2216,78 @@ class SplitSolver():
           method=ivp_method,
           max_step=ivp_max_step)
         return soln, soln.t.max()
+      try:
+        max_newton_iter = 7
+        newton_residual_atol = 1e-4
+        # Take p_vent as initial guess
+        p_iterate = solver.p_vent
+        # Debug history
+        _p_iterate_hist = []
+        _p_residual_hist = []
+        _u_in_hist = []
+        for i in range(max_newton_iter):
+          # Choose local ode rtol
+          # if i == 0:
+          #   rtol = 1e-5
+          # else:
+          #   # Estimate local rtol requirement from residual of p_inlet
+          #   rtol = max(min(1e-5 * np.abs(residual) / p0, 1e-5), 1e-9)
+          rtol = 1e-6
+          # Newton iteration
+          (p_iterate, residual, u_in, slope,
+           u_in_sensitivity_pout,
+           uin_change_estimate,
+           d_dpout_integralp,
+           soln) = split_solver.newton_map_pout(
+             p0, p_iterate, xlims, q5_interp_scalar,
+             ode_rtol=rtol, M_eps=1e-2)
+          # print(p_iterate, u_in, slope, residual/p0, rtol)
+          # if (residual/p0) * (residual/p0) < newton_residual_tol * newton_residual_tol:
+          #   solver.logger.debug(f"Newton tolerance reached at Newton step {i}")
+          #   break
+
+          _p_iterate_hist.append(p_iterate)
+          _p_residual_hist.append(residual)
+          _u_in_hist.append(u_in)
+
+          if np.abs(uin_change_estimate) < newton_residual_atol:
+            solver.logger.debug(f"Inlet velocity atol {newton_residual_atol:.2e} reached in Newton step {i}")
+            break
+          if i >= 1 and residual * residual > _p_residual_hist[-2] * _p_residual_hist[-2]:
+            solver.logger.debug(f"Residual increased at Newton step {i}")
+            break
+        else:
+          raise ValueError(f"Max number of newton iterations reached ({max_newton_iter}).")
+        # Cache new iterate for next call
+        solver.p_vent = p_iterate
+        # Cache inlet velocity for alternative strategy
+        solver.u0 = u_in
+
+        finally_use_forward_system = False
+        if finally_use_forward_system:
+          # Solve system using solved u0 TODO: replace wiht p, M2 system with adapted output
+          self.logger.debug(f"Solving forward ODE with (p,u) system with solved u_in ({u_in}).")
+          soln, scales = solver.solve_time_indep_system(q5_interp_scalar, p0=p0,
+                                              u0=u_in,
+                                              xlims=xlims_unlimited,
+                                              method=ivp_method,
+                                              max_step=ivp_max_step)
+          return (lambda x: np.einsum("i..., i -> i...",
+                                  soln.sol(x + (soln.t.max() - xlims[-1])),
+                                  scales),
+                  u_in,)
+        else:
+          return (lambda x: soln.sol(x)[0:2,...], u_in,)
+      except FileNotFoundError as e:# Exception as e: 
+        solver.logger.warning(f"Error encounted in Newton-reverse-IVP. Message follows: ")
+        solver.logger.warning(f"{e}")
+        solver.logger.debug(f"Proceeding with bisection strategy. ")
       
       # Try neighbourhood search of u0
       try:
         # Bracket expansion factor (whatever implementation)
         exp_factor = 1.1
-        bracket_L = np.array([self.u0, self.u0])
+        bracket_L = np.array([solver.u0, solver.u0])
         bracket_mult = np.array([1/exp_factor, exp_factor])
         root_find_fn = lambda u0: solve_time_indep_ivp_L(u0)[1] - xlims[-1]
         root_table = np.zeros((5,2))
@@ -1762,7 +2316,7 @@ class SplitSolver():
         _x_secant_hist = [*bracket_L]
         _y_secant_hist = [*vals_L]
         atol = 1e-1
-        for i in range(30):
+        for i in range(60):
           new_x = 0.5 * (bracket_L[0] + bracket_L[1])
           new_y = root_find_fn(new_x)
           # Use midpoint as new bracket
@@ -1806,6 +2360,7 @@ class SplitSolver():
                                           max_step=ivp_max_step)
       # Cache u0 for next iteration
       solver.u0 = u0_solved
+      solver.p_vent = soln.y[0,-1] * scales[0]
       # Shift solution so that choked flow is exactly at conduit_length
       #   This strategy extrapolates on the bottom instead of the top
       return (lambda x: np.einsum("i..., i -> i...",
@@ -1861,12 +2416,12 @@ class SplitSolver():
       q5_interp_raw = scipy.interpolate.PchipInterpolator(x, q5,
         extrapolate=True, axis=1)
       # TODO: prevent undefined behaviour when called with a scalar, merge following two funcs
-      def q5_interp(xq):
+      def q5_interp(xq, nu=0):
         ''' Vectorized returns '''
-        return np.where(xq <= x.max(), q5_interp_raw(xq), q5[:,-1:])
-      def q5_interp_scalar(xq):
+        return np.where(xq <= x.max(), q5_interp_raw(xq, nu=nu), q5[:,-1:])
+      def q5_interp_scalar(xq, nu=0):
         ''' Scalar returns'''
-        return np.where(xq <= x.max(), q5_interp_raw(xq), q5[:,-1])
+        return np.where(xq <= x.max(), q5_interp_raw(xq, nu=nu), q5[:,-1])
       self.q5_interp = q5_interp
 
       # q2 solve and obtain interpolator
@@ -1887,7 +2442,7 @@ class SplitSolver():
     self.logger.debug(f"Solve complete.")
     return q2, q5
 
-  def full_solve_equilibrum(self, xlims, Nx=1001, p0=80e6, yWt0=0.025,
+  def full_solve_equilibrum(self, xlims, Nx=2001, p0=80e6, yWt0=0.025,
                 yC0=0.4, CFL=0.8, ivp_method="BDF", ivp_max_step=np.inf) -> tuple:
     ''' Solve the QSS system with choked outflow and eq. exsoln, frag. '''
     clock_prep = perf_counter()
@@ -2190,10 +2745,13 @@ if __name__ == "__main__":
   q_pu, q_t = split_solver.full_solve_choked((0,1000), Nx=2001, p0=40e6, yWt0=yWt0,
                   yC0=0.4, CFL=200, ivp_method="RK45", ivp_max_step=np.inf)
   print(f"Final t: {split_solver.t} s")
-  np.save("crossverif_tauf_run12_q2", split_solver.out_q2)
-  np.save("crossverif_tauf_run12_q5", split_solver.out_q5)
-  np.save("crossverif_tauf_run12_t", split_solver.out_t)
-  np.save("crossverif_tauf_run12_x", split_solver.x)
+  np.save("crossverif_tauf_run15_q2", split_solver.out_q2)
+  np.save("crossverif_tauf_run15_q5", split_solver.out_q5)
+  np.save("crossverif_tauf_run15_t", split_solver.out_t)
+  np.save("crossverif_tauf_run15_x", split_solver.x)
+
+  # 13: first run using Newton
+  # 14: Newton with analytic Jacobian, RK45, rtol=1e-6 (< 1 s per step)
 
   # split_solver = SplitSolver(params, Nt=200)
   # q_pu, q_t = split_solver.full_solve_choked((0,1000), Nx=1001, p0=40e6, yWt0=yWt0,
