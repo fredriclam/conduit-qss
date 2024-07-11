@@ -1102,11 +1102,32 @@ class SplitSolver():
         use_integrated_friction=use_integrated_friction),
       (xlim[-1], xlim[0]),
       Q_pM2,
+      # np.array([1e5, u_outlet, 1, 0]),
       method="RK45",
       dense_output=True, # TODO: request only dense output for the last output
       max_step=np.inf,
       rtol=ode_rtol,
       atol=1e-6,)
+
+    ''' New feature: pressure BC solve. If this yields a solution, this suggests subsonic. '''
+    # DEBUG: TODO: Lower bound solve
+    # p_outlet_min = 1e5
+    # rho_outlet = self.rho_p(yWv_outlet, p_outlet_min)
+    # cT2_outlet = self.isothermal_sound_speed_squared(yWv_outlet, *self.p_ptilde(rho_outlet, yWv_outlet))
+    # u_outlet = np.sqrt((1-M_eps) * (1-M_eps) * cT2_outlet)
+    # # Assemble boundary condition of q2 at vent with column of identity and p-integral zero
+    # Q_pM2 = np.array([p_outlet_min, u_outlet, 1, 0])
+    # soln = scipy.integrate.solve_ivp(
+    #   lambda x, Q: self.primal_var_RHS(x, Q, q5_interp,
+    #     use_integrated_friction=use_integrated_friction),
+    #   (xlim[-1], xlim[0]),
+    #   Q_pM2,
+    #   method="RK45",
+    #   dense_output=True, # TODO: request only dense output for the last output
+    #   max_step=np.inf,
+    #   rtol=ode_rtol,
+      # atol=1e-6,)
+    
     # Interpret solution at inlet
     p_in_solved = soln.y[0,-1]
     dpin_dpout = soln.y[2,-1]
@@ -1480,17 +1501,24 @@ class SplitSolver():
     q7[5,...] += yC_perturbation
     return q7
   
-  def BC_gaussian_crossverif(self, t, p0=40e6, u0=0.7, yWt0=0.01747572815, yC0=0.4, yF0=0.0,):
+  def BC_gaussian_crossverif(self, t, p0=40e6, u0=0.7, yWt0=0.01747572815,
+                             t0=40, sigma=8,
+                             yC0=0.4, yF0=0.0, one_way=False):
     ''' Non-equilibrium gaussian for comparison with compressible code '''
     # Gaussian parameters
     amp = 0.1
-    t0 = 40   # "gaussian_tpulse"
-    sigma = 8
+    t0 = t0   # "gaussian_tpulse"
+    sigma = sigma
     chi_water = 0.03
     # Compute Gaussian perturbation
     _arg = ((t - t0) / sigma)
     # Important: note /2 factor
-    yC_perturbation = amp * np.exp(-_arg * _arg / 2) #/ np.exp(0)
+    if one_way:
+      yC_perturbation = amp * np.where(t > t0,
+              1,
+              np.exp(-_arg * _arg / 2))
+    else:
+      yC_perturbation = amp * np.exp(-_arg * _arg / 2)
     # Water part:
     phi_crys = yC0 * np.ones_like(t) + yC_perturbation
     yWt = chi_water * (1.0 - phi_crys) / (1 + chi_water)
@@ -1721,8 +1749,8 @@ class SplitSolver():
       BC_fn(t + (0 - x2) / u0)[2:,...]) # Source from BC at t + eps
     rhoprime = q5[0,...] # unused
     yWv = q5[1,...]
-    yWt = q5[2,...] # const
-    yC  = q5[3,...] # const
+    yWt = q5[2,...] # const along characteristic
+    yC  = q5[3,...] # const along characteristic
     yF  = q5[4,...]
     # Compute dependents
     yL = (1.0 - (yC + yWt))
@@ -1765,7 +1793,6 @@ class SplitSolver():
 
       # Unpack updated quantities
       yWv_updated, yF_updated = q_updated
-      
     else:
       # RK4 substep strategy (for largest A-stability region)
       # RK4 step 1 with p at location x(t) with exponential substepping
@@ -1825,6 +1852,10 @@ class SplitSolver():
                           yC,
                           yF_updated,
                           ], axis=0)
+    
+    # Strong BC replacement for boundary node
+    y_updated[:,0] = BC_fn(t + dt)[2:,...]
+
     return y_updated
   
   def unsteady_solve_RHS(self, BC_fn, x, t, q5:np.array, q2:np.array,
@@ -2075,7 +2106,9 @@ class SplitSolver():
   
   def full_solve_choked(self, xlims, Nx=1001, p0=80e6, u0=None, yWt0=0.025,
                  yC0=0.4, yF0=0.0,
-                 CFL=0.8, ivp_method="BDF", ivp_max_step=np.inf):
+                 CFL=0.8, ivp_method="BDF", ivp_max_step=np.inf,
+                 t0=60, sigma=20, # Gaussian BC parameters
+                 ):
     ''' Solve the full QSS system with choked outflow. '''
     clock_prep = perf_counter()
     # Construct grid
@@ -2154,7 +2187,9 @@ class SplitSolver():
     # BC_unsteady = lambda t: self.BC_gaussian(t,p0=p0, u0=u0,
     #                                          yWt0=yWt0, yC0=yC0, yF0=yF0)
     BC_unsteady = lambda t: self.BC_gaussian_crossverif(t,p0=p0, u0=u0,
-                                             yWt0=yWt0, yC0=yC0, yF0=yF0)
+                                                        t0=t0,
+                                                        sigma=sigma,
+                                             yWt0=yWt0, yC0=yC0, yF0=yF0, one_way=True)
     # BC_unsteady = lambda t: self.BC_steady(t,p0=p0, u0=u0,
     #                                          yWt0=yWt0, yC0=yC0, yF0=yF0)
 
@@ -2217,7 +2252,7 @@ class SplitSolver():
           max_step=ivp_max_step)
         return soln, soln.t.max()
       try:
-        max_newton_iter = 7
+        max_newton_iter = 14
         newton_residual_atol = 1e-4
         # Take p_vent as initial guess
         p_iterate = solver.p_vent
@@ -2238,7 +2273,7 @@ class SplitSolver():
            u_in_sensitivity_pout,
            uin_change_estimate,
            d_dpout_integralp,
-           soln) = split_solver.newton_map_pout(
+           soln) = self.newton_map_pout(
              p0, p_iterate, xlims, q5_interp_scalar,
              ode_rtol=rtol, M_eps=1e-2)
           # print(p_iterate, u_in, slope, residual/p0, rtol)
@@ -2712,7 +2747,7 @@ if __name__ == "__main__":
       np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
     crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
     
-    viscosity = meltVisc * crysVisc
+    viscosity = np.clip(meltVisc * crysVisc, 0, 1e12)
     return viscosity
   
   # Cross-verification case
@@ -2742,13 +2777,18 @@ if __name__ == "__main__":
   # q_pu, q_t = split_solver.full_solve_choked((0,1000), Nx=2001, p0=40e6, yWt0=yWt0,
   #                 yC0=0.4, CFL=200, ivp_method="BDF", ivp_max_step=np.inf)
   split_solver = SplitSolver(params, Nt=2000)
-  q_pu, q_t = split_solver.full_solve_choked((0,1000), Nx=2001, p0=40e6, yWt0=yWt0,
-                  yC0=0.4, CFL=200, ivp_method="RK45", ivp_max_step=np.inf)
+  q_pu, q_t = split_solver.full_solve_choked((0,1000), Nx=1001, p0=40e6, yWt0=yWt0,
+                  yC0=0.4, CFL=0.1, ivp_method="RK45", ivp_max_step=np.inf)
   print(f"Final t: {split_solver.t} s")
-  np.save("crossverif_tauf_run15_q2", split_solver.out_q2)
-  np.save("crossverif_tauf_run15_q5", split_solver.out_q5)
-  np.save("crossverif_tauf_run15_t", split_solver.out_t)
-  np.save("crossverif_tauf_run15_x", split_solver.x)
+  # New verification runs
+  # np.save("verif_tauf_run15_q2", split_solver.out_q2)
+  # np.save("verif_tauf_run15_q5", split_solver.out_q5)
+  # np.save("verif_tauf_run15_t", split_solver.out_t)
+  # np.save("verif_tauf_run15_x", split_solver.x)
+  # np.save("crossverif_tauf_run15_q2", split_solver.out_q2)
+  # np.save("crossverif_tauf_run15_q5", split_solver.out_q5)
+  # np.save("crossverif_tauf_run15_t", split_solver.out_t)
+  # np.save("crossverif_tauf_run15_x", split_solver.x)
 
   # 13: first run using Newton
   # 14: Newton with analytic Jacobian, RK45, rtol=1e-6 (< 1 s per step)
